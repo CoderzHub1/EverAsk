@@ -1,6 +1,16 @@
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <vector>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+// ---------- OLED Display ----------
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1
+
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
 // ---------- WiFi & server ----------
 const char* ssid       = "Motorola";
@@ -13,11 +23,6 @@ const int SAMPLE_RATE   = 8000;   // Hz
 const int MAX_SECONDS   = 4;      // safe limit
 int MAX_SAMPLES         = SAMPLE_RATE * MAX_SECONDS; 
 
-// thresholds
-// thresholds (not used anymore)
-int voiceThreshold   = 2500;
-int silenceThreshold = 2250;
-
 // dynamic buffer
 uint8_t *samples = nullptr;
 size_t sampleCount = 0;
@@ -25,6 +30,37 @@ size_t sampleCount = 0;
 unsigned long lastSend = 0;
 unsigned long nextSampleTime = 0; 
 unsigned long sampleInterval = 1000000 / SAMPLE_RATE; // microseconds between samples
+
+// ---------- Eye animation variables ----------
+// Eye positions
+int leftEyeX = 45;
+int rightEyeX = 80;
+int eyeY = 18;
+int eyeWidth = 25;
+int eyeHeight = 30;
+
+// Offsets
+int targetOffsetX = 0;
+int targetOffsetY = 0;
+int moveSpeed = 5;
+
+// Blinking
+bool isBlinking = false;
+bool closing = true;
+float blinkProgress = 0;        // 0 → 1 (open → closed)
+float blinkSpeed = 0.15;        // Faster blinking
+unsigned long lastBlinkTrigger = 0;
+int blinkDelay = 3500;          // Blinks faster/more frequent
+unsigned long lastEyeMove = 0;
+unsigned long blinkPauseStart = 0;
+bool inBlinkPause = false;
+
+// Eye position interpolation
+float offsetX = 0, offsetY = 0;
+
+// Display update timing
+unsigned long lastDisplayUpdate = 0;
+const int displayInterval = 18; // milliseconds between display updates
 
 // ---------- Little-endian helpers ----------
 void write_u32_le(uint8_t *buf, uint32_t value) {
@@ -114,8 +150,99 @@ void sendWavToServer() {
   http.end();
 }
 
+// ---------- Eye animation functions ----------
+void updateEyeAnimation() {
+  unsigned long t = millis();
+
+  // Trigger blink
+  if (!isBlinking && t - lastBlinkTrigger > blinkDelay) {
+    isBlinking = true;
+    closing = true;
+    blinkProgress = 0;
+    lastBlinkTrigger = t;
+    inBlinkPause = false;
+  }
+
+  // Blink update
+  if (isBlinking) {
+    if (closing) {
+      blinkProgress += blinkSpeed;
+      if (blinkProgress >= 1.0) {
+        blinkProgress = 1.0;
+        closing = false;
+        inBlinkPause = true;
+        blinkPauseStart = t;
+      }
+    } else if (inBlinkPause) {
+      // Non-blocking pause when fully closed
+      if (t - blinkPauseStart >= 40) {
+        inBlinkPause = false;
+      }
+    } else {
+      blinkProgress -= blinkSpeed;
+      if (blinkProgress <= 0.0) {
+        blinkProgress = 0.0;
+        isBlinking = false;
+      }
+    }
+  }
+
+  // Eye movement only when NOT blinking
+  if (t - lastEyeMove > random(1200, 2500) && !isBlinking) {
+    int m = random(0, 8);
+    if (m == 0) { targetOffsetX = -10; targetOffsetY = 0; }
+    else if (m == 1) { targetOffsetX = 10; targetOffsetY = 0; }
+    else if (m == 2) { targetOffsetX = -10; targetOffsetY = -8; }
+    else if (m == 3) { targetOffsetX = 10; targetOffsetY = -8; }
+    else if (m == 4) { targetOffsetX = -10; targetOffsetY = 8; }
+    else if (m == 5) { targetOffsetX = 10; targetOffsetY = 8; }
+    else { targetOffsetX = 0; targetOffsetY = 0; }
+
+    lastEyeMove = t;
+  }
+
+  // Smooth position interpolation
+  offsetX += (targetOffsetX - offsetX) / moveSpeed;
+  offsetY += (targetOffsetY - offsetY) / moveSpeed;
+}
+
+void drawBlinkEye(int x, int y, int w, int h, float easedBlink) {
+  // easedBlink: 0 = open, 1 = closed
+
+  int cover = easedBlink * (h / 2);
+
+  // Base eye shape
+  display.fillRoundRect(x, y, w, h, 5, WHITE);
+
+  // Eyelids
+  display.fillRect(x, y, w, cover, BLACK);               // top lid
+  display.fillRect(x, y + h - cover, w, cover, BLACK);   // bottom lid
+}
+
+void renderEyes() {
+  display.clearDisplay();
+
+  // Ease-out calculation
+  float eased = blinkProgress;
+  eased = eased * eased;    // ease-out effect (slows down at the end)
+
+  drawBlinkEye(leftEyeX + offsetX, eyeY + offsetY, eyeWidth, eyeHeight, eased);
+  drawBlinkEye(rightEyeX + offsetX, eyeY + offsetY, eyeWidth, eyeHeight, eased);
+
+  display.display();
+}
+
 void setup() {
   Serial.begin(115200);
+
+  // ---------- OLED Display Setup ----------
+  if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println(F("SSD1306 allocation failed"));
+    for(;;);
+  }
+  display.clearDisplay();
+  display.display();
+  delay(700);
 
   // ---------- PSRAM allocation ----------
   if (psramFound()) {
@@ -139,6 +266,7 @@ void setup() {
     Serial.print(".");
   }
   Serial.println("\nConnected!");
+  
   // Configure ADC for better range on ESP32
   analogReadResolution(12);
   analogSetPinAttenuation(MIC_PIN, ADC_11db);
@@ -146,6 +274,8 @@ void setup() {
   // Initialize timing
   nextSampleTime = micros();
   lastSend = millis();
+  lastEyeMove = millis();
+  lastDisplayUpdate = millis();
   
   Serial.print("Sample rate: ");
   Serial.print(SAMPLE_RATE);
@@ -156,11 +286,15 @@ void setup() {
   Serial.print("Buffer size: ");
   Serial.print(MAX_SAMPLES);
   Serial.println(" samples");
+  
+  Serial.println("System ready - Eyes and Microphone active!");
 }
 
 void loop() {
   unsigned long currentTime = micros();
+  unsigned long currentMillis = millis();
   
+  // ---------- Microphone Sampling ----------
   // Sample at precise intervals for true 8kHz rate
   if (currentTime >= nextSampleTime) {
     int raw = analogRead(MIC_PIN);
@@ -173,8 +307,16 @@ void loop() {
     nextSampleTime = currentTime + sampleInterval;
   }
 
+  // ---------- Eye Animation Update (only update display at intervals) ----------
+  if (currentMillis - lastDisplayUpdate >= displayInterval) {
+    updateEyeAnimation();
+    renderEyes();
+    lastDisplayUpdate = currentMillis;
+  }
+
+  // ---------- Audio Processing ----------
   // Every 4 seconds, send whatever is in buffer
-  if (millis() - lastSend >= 4000) {
+  if (currentMillis - lastSend >= 4000) {
     Serial.print("Sending 4-second chunk... Samples collected: ");
     Serial.print(sampleCount);
     Serial.print(" (Expected: ");
@@ -182,7 +324,7 @@ void loop() {
     Serial.println(")");
     sendWavToServer();
     sampleCount = 0;      // reset buffer after sending
-    lastSend = millis();  // reset timer
+    lastSend = currentMillis;  // reset timer
     nextSampleTime = micros(); // reset sample timing
   }
 
@@ -191,11 +333,11 @@ void loop() {
     Serial.print("Buffer full; sending chunk early... Samples: ");
     Serial.print(sampleCount);
     Serial.print(" Time elapsed: ");
-    Serial.print(millis() - lastSend);
+    Serial.print(currentMillis - lastSend);
     Serial.println("ms");
     sendWavToServer();
     sampleCount = 0;
-    lastSend = millis();
+    lastSend = currentMillis;
     nextSampleTime = micros();
   }
 }
