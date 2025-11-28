@@ -3,9 +3,9 @@
 #include <vector>
 
 // ---------- WiFi & server ----------
-const char* ssid       = "Poorva";
-const char* password   = "jishi143";
-const char* SERVER_URL = "http://192.168.0.105:5000/transcribe";
+const char* ssid       = "Motorola";
+const char* password   = "hell-nah";
+const char* SERVER_URL = "http://10.205.157.83:5000/transcribe";
 
 // ---------- Microphone ----------
 const int MIC_PIN       = 34;
@@ -14,15 +14,15 @@ const int MAX_SECONDS   = 5;      // safe limit
 int MAX_SAMPLES         = SAMPLE_RATE * MAX_SECONDS; 
 
 // thresholds
-int voiceThreshold   = 2500;   // start recording
-int silenceThreshold = 2250;   // stop recording
+// thresholds (not used anymore)
+int voiceThreshold   = 2500;
+int silenceThreshold = 2250;
 
 // dynamic buffer
 uint8_t *samples = nullptr;
 size_t sampleCount = 0;
 
-bool recording = false;
-unsigned long lastLoud = 0;
+unsigned long lastSend = 0;
 
 // ---------- Little-endian helpers ----------
 void write_u32_le(uint8_t *buf, uint32_t value) {
@@ -86,14 +86,29 @@ void sendWavToServer() {
   Serial.println(wavData.size());
 
   HTTPClient http;
-  http.begin(SERVER_URL);
+  WiFiClient client;
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi not connected; skipping send.");
+    return;
+  }
+  if (!http.begin(client, SERVER_URL)) {
+    Serial.println("HTTP begin failed.");
+    return;
+  }
   http.addHeader("Content-Type", "audio/wav");
+  http.setTimeout(15000);
+  http.setReuse(false);
 
-  int code = http.POST(wavData.data(), wavData.size());
+  int code = http.POST((uint8_t*)wavData.data(), (size_t)wavData.size());
   Serial.print("Server response code: ");
   Serial.println(code);
 
-  if (code > 0) Serial.println(http.getString());
+  if (code > 0) {
+    Serial.println(http.getString());
+  } else {
+    Serial.print("HTTP error: ");
+    Serial.println(http.errorToString(code));
+  }
   http.end();
 }
 
@@ -122,38 +137,33 @@ void setup() {
     Serial.print(".");
   }
   Serial.println("\nConnected!");
+  // Configure ADC for better range on ESP32
+  analogReadResolution(12);
+  analogSetPinAttenuation(MIC_PIN, ADC_11db);
 }
 
 void loop() {
   int raw = analogRead(MIC_PIN);
 
-  // ---- Start recording if above voice threshold ----
-  if (raw > voiceThreshold) {
-    if (!recording) {
-      Serial.println("Recording started...");
-      sampleCount = 0;
-    }
-    recording = true;
-    lastLoud = millis();
-
-    if (sampleCount < MAX_SAMPLES) {
-      samples[sampleCount++] = map(raw, 0, 4095, 0, 255);
-    }
+  // Sample continuously at ~8kHz into buffer
+  if (sampleCount < MAX_SAMPLES) {
+    samples[sampleCount++] = map(raw, 0, 4095, 0, 255);
   }
 
-  // ---- Keep recording until silence ----
-  if (recording && raw > silenceThreshold) {
-    if (sampleCount < MAX_SAMPLES) {
-      samples[sampleCount++] = map(raw, 0, 4095, 0, 255);
-    }
-    lastLoud = millis();
-  }
-
-  // ---- Stop after 4 seconds of silence ----
-  if (recording && raw < silenceThreshold && millis() - lastLoud >= 4000) {
-    Serial.println("Silence detected. Sending audio...");
-    recording = false;
+  // Every 4 seconds, send whatever is in buffer
+  if (millis() - lastSend >= 4000) {
+    Serial.println("Sending 4-second chunk...");
     sendWavToServer();
+    sampleCount = 0;      // reset buffer after sending
+    lastSend = millis();  // reset timer
+  }
+
+  // If buffer overflows before 4s, send immediately to avoid loss
+  if (sampleCount >= MAX_SAMPLES) {
+    Serial.println("Buffer full; sending chunk early...");
+    sendWavToServer();
+    sampleCount = 0;
+    lastSend = millis();
   }
 
   delayMicroseconds(125); // ~8kHz

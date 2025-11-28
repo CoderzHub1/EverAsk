@@ -2,5 +2,4 @@ flask
 python-dotenv
 google-genai
 numpy
-# Prefer the upstream repo to match your current install
-whisper @ git+https://github.com/openai/whisper.git
+SpeechRecognition
